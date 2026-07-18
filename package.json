@@ -8,15 +8,16 @@
     "web": "expo start --web"
   },
   "dependencies": {
+    "crypto-js": "^4.2.0",
     "expo": "~54.0.36",
+    "expo-camera": "~17.0.10",
+    "expo-secure-store": "~15.0.8",
     "expo-status-bar": "~3.0.9",
+    "jsencrypt": "^3.3.2",
     "react": "19.1.0",
     "react-native": "0.81.5",
-    "expo-camera": "~17.0.10",
-    "react-native-svg": "15.12.1",
     "react-native-qrcode-svg": "^6.3.1",
-    "crypto-js": "^4.2.0",
-    "jsencrypt": "^3.3.2"
+    "react-native-svg": "15.12.1"
   },
   "private": true
 }

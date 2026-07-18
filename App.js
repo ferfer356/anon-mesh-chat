@@ -4,20 +4,18 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import QRCode from 'react-native-qrcode-svg';
 import CryptoJS from 'crypto-js';
 import { JSEncrypt } from 'jsencrypt';
+import * as SecureStore from 'expo-secure-store'; // Přidaná knihovna pro trvalé ukládání
 
 const { width } = Dimensions.get('window');
 
-// Distribuovaná síť celosvětových záložních P2P uzlů
 const DHT_ROUTING_RELAYS = [
   "wss://relay.peerjs.com",
   "wss://star.libp2p.io",
   "wss://wrtc-star.discovery.libp2p.io"
 ];
 
-// Asymetrické šifrovací jádro (RSA-1024 + PBKDF2)
 const cryptoEngine = {
   generateSecureIdentity: (masterPassword) => {
-    // 1024 bitů zaručuje okamžitý start na mobilech při zachování neprůstřelné bezpečnosti
     const crypt = new JSEncrypt({ default_key_size: 1024 });
     const salt = "HYBRID_DHT_MESH_ULTRA_SECURE_SALT_2026";
     
@@ -54,7 +52,7 @@ const cryptoEngine = {
     const base = text.slice(0, -1);
     const matrix = {
       '´': { 'A':'Á', 'E':'É', 'I':'Í', 'O':'Ó', 'U':'Ú', 'Y':'Ý', 'a':'á', 'e':'é', 'i':'í', 'o':'ó', 'u':'ú', 'y':'ý' },
-      'ˇ': { 'E':'Ě', 'C':'Č', 'S':'Š', 'Z':'Ž', 'R':'Ř', 'T':'Ť', 'D':'Ď', 'N':'Ň', 'U':'Ů', 'e':'ě', 'c':'č', 's':'š', 'z':'ž', 'r':'ř', 't':'ť', 'd':'ď', 'n':'ň', 'u':'ů' }
+      'ˇ': { 'E':'Ě', 'C':'Č', 'S':'Š', 'Z':'Ž', 'R':'Ř', 'T':'Ť', 'D':'Ď', 'N':'Ň', 'U':'Ů', 'e':'ě', 'c':'č', 's':'š', 'z':'ž', 'r':'ř', 't':'ť', 'd':'ň', 'n':'ň', 'u':'ů' }
     };
     if (matrix[accent] && matrix[accent][last]) return base + matrix[accent][last];
     return text;
@@ -86,6 +84,25 @@ export default function App() {
   
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [isCameraScanned, setIsCameraScanned] = useState(false);
+
+  // KONTROLA EXISTUJÍCÍ IDENTITY PŘI STARTU
+  useEffect(() => {
+    async function checkExistingIdentity() {
+      try {
+        const savedHash = await SecureStore.getItemAsync('masterHash');
+        const savedIdentity = await SecureStore.getItemAsync('userIdentity');
+        
+        if (savedHash && savedIdentity) {
+          setMasterHash(savedHash);
+          setIdentity(JSON.parse(savedIdentity));
+          setIsFirstLaunch(false); // Už to není první spuštění, identita existuje
+        }
+      } catch (e) {
+        console.log("Nepodařilo se načíst identitu z paměti.");
+      }
+    }
+    checkExistingIdentity();
+  }, []);
 
   // Síťový useEffect pro správu P2P komunikace
   useEffect(() => {
@@ -284,27 +301,31 @@ export default function App() {
     
     setIsProcessingKeys(true);
     
-    // Použití setTimeout uvolní JS vlákno, vykreslí loader a zabrání zamrznutí UI
-    setTimeout(() => {
+    setTimeout(async () => {
       try {
         const generatedHash = CryptoJS.SHA256(passwordInput).toString();
+        
         if (isFirstLaunch) {
+          // PRVNÍ SPUŠTĚNÍ - Generujeme identitu a UKLÁDÁME do telefonu
           const secureIdentity = cryptoEngine.generateSecureIdentity(passwordInput);
+          
+          await SecureStore.setItemAsync('masterHash', generatedHash);
+          await SecureStore.setItemAsync('userIdentity', JSON.stringify(secureIdentity));
+          
           setIdentity(secureIdentity);
           setMasterHash(generatedHash);
           setIsFirstLaunch(false);
           setIsLoggedIn(true);
         } else {
+          // DALŠÍ SPUŠTĚNÍ - Kontrola hesla vůči uloženému hashi
           if (generatedHash === masterHash || passwordInput === "1234") {
-            const secureIdentity = cryptoEngine.generateSecureIdentity(passwordInput);
-            setIdentity(secureIdentity);
             setIsLoggedIn(true);
           } else {
             Alert.alert("Přístup odepřen", "Zadané heslo neodpovídá vygenerované identitě.");
           }
         }
       } catch (e) {
-        Alert.alert("Chyba", "Selhalo asynchronní generování klíčů.");
+        Alert.alert("Chyba", "Selhalo ukládání nebo generování bezpečnostní identity.");
       } finally {
         setPasswordInput("");
         setIsProcessingKeys(false);
