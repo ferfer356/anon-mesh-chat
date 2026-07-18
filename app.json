@@ -12,6 +12,9 @@
     "android": {
       "package": "com.anonmesh.chat"
     },
+    "ios": {
+      "bundleIdentifier": "com.anonmesh.chat"
+    },
     "extra": {
       "eas": {
         "projectId": "acd53ea1-b78b-4499-a805-4c882ad35f54"
