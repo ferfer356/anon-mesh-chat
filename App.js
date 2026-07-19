@@ -11,7 +11,12 @@ const { width } = Dimensions.get('window');
 const DHT_ROUTING_RELAYS = [
   "wss://relay.peerjs.com",
   "wss://star.libp2p.io",
-  "wss://wrtc-star.discovery.libp2p.io"
+  "wss://wrtc-star.discovery.libp2p.io",
+  "wss://peerjs.com:443",
+  "wss://0.peerjs.com:443",
+  "wss://broker.hivemq.com:8884",
+  "wss://wrtc-star1.paral.io",
+  "wss://wrtc-star2.paral.io"
 ];
 
 const cryptoEngine = {
@@ -85,6 +90,20 @@ export default function App() {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [isCameraScanned, setIsCameraScanned] = useState(false);
 
+  // ULOŽENÍ PEERA DO HISTORIE (trvalá paměť)
+  const savePeerToHistory = async (peerId) => {
+    try {
+      const raw = await SecureStore.getItemAsync('peerHistory');
+      const existing = raw ? JSON.parse(raw) : [];
+      if (!existing.includes(peerId)) {
+        existing.push(peerId);
+        await SecureStore.setItemAsync('peerHistory', JSON.stringify(existing));
+      }
+    } catch (e) {
+      console.log("Nepodařilo se uložit peer do historie:", e);
+    }
+  };
+
   // KONTROLA EXISTUJÍCÍ IDENTITY PŘI STARTU
   useEffect(() => {
     async function checkExistingIdentity() {
@@ -95,7 +114,7 @@ export default function App() {
         if (savedHash && savedIdentity) {
           setMasterHash(savedHash);
           setIdentity(JSON.parse(savedIdentity));
-          setIsFirstLaunch(false); // Už to není první spuštění, identita existuje
+          setIsFirstLaunch(false);
         }
       } catch (e) {
         console.log("Nepodařilo se načíst identitu z paměti.");
@@ -120,9 +139,45 @@ export default function App() {
         ws = new WebSocket(`${targetRelay}?id=${identity.nodeId}`);
         meshSocket.current = ws;
 
-        ws.onopen = () => {
+        ws.onopen = async () => {
           setNetworkStatus("ONLINE (DHT MESH Active)");
+          // Oznámit svou přítomnost v síti
           ws.send(JSON.stringify({ type: "DHT_ANNOUNCE", from: identity.nodeId, publicKey: identity.publicKeyPem }));
+
+          // AUTOMATICKÉ SÍŤOVÉ "UČENÍ" - obejít historicky známé uzly
+          try {
+            const raw = await SecureStore.getItemAsync('peerHistory');
+            const knownPeers = raw ? JSON.parse(raw) : [];
+            if (knownPeers.length > 0) {
+              setNetworkStatus(`ONLINE – OBNOVUJI ${knownPeers.length} KONTAKTŮ...`);
+              knownPeers.forEach((peerId, idx) => {
+                // Rozesíláme handshake s malým rozestupem, aby relay nebyl zahlcen
+                setTimeout(() => {
+                  if (ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                      type: "MESH_HANDSHAKE",
+                      from: identity.nodeId,
+                      target: peerId,
+                      publicKey: identity.publicKeyPem
+                    }));
+                    // Přidáme do seznamu jako "čekající" – alias bude upřesněn po odpovědi
+                    setDhtPeers(prev => {
+                      if (!prev.some(p => p.id === peerId)) {
+                        return [...prev, { id: peerId, alias: `NODE_${peerId.substring(8, 14).toUpperCase()}` }];
+                      }
+                      return prev;
+                    });
+                  }
+                }, idx * 600);
+              });
+              // Po dokončení handshake kola obnovíme status
+              setTimeout(() => {
+                setNetworkStatus("ONLINE (DHT MESH Active)");
+              }, knownPeers.length * 600 + 500);
+            }
+          } catch (e) {
+            console.log("Chyba při načítání peerHistory:", e);
+          }
         };
 
         ws.onmessage = (event) => {
@@ -131,16 +186,26 @@ export default function App() {
             if (payload.target === identity.nodeId || payload.type === "BROADCAST") {
               
               if (payload.type === "MESH_HANDSHAKE") {
-                setPeerKeysDatabase(prev => ({ ...prev, [payload.from]: payload.publicKey }));
+                // Uložit veřejný klíč peera
+                if (payload.publicKey) {
+                  setPeerKeysDatabase(prev => ({ ...prev, [payload.from]: payload.publicKey }));
+                }
+                // Přidat peera do seznamu a trvale uložit
                 setDhtPeers(prev => {
                   if (!prev.some(p => p.id === payload.from)) {
+                    savePeerToHistory(payload.from);
                     return [...prev, { id: payload.from, alias: `NODE_${payload.from.substring(8, 14).toUpperCase()}` }];
                   }
                   return prev;
                 });
-                if (currentScreen !== "chat") {
-                  setActivePeer(payload.from);
-                  setCurrentScreen("chat");
+                // Odpovědět handshake zpět (vzájemná výměna klíčů)
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: "MESH_HANDSHAKE",
+                    from: identity.nodeId,
+                    target: payload.from,
+                    publicKey: identity.publicKeyPem
+                  }));
                 }
               }
 
@@ -197,6 +262,7 @@ export default function App() {
 
     setDhtPeers(prev => {
       if (!prev.some(p => p.id === targetNodeId)) {
+        savePeerToHistory(targetNodeId);
         return [...prev, { id: targetNodeId, alias: `NODE_${targetNodeId.substring(8, 14).toUpperCase()}` }];
       }
       return prev;
