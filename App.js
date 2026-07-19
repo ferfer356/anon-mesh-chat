@@ -98,6 +98,37 @@ export default function App() {
   // Sledování stavu AppState pro blackout a zamykání
   const appStateRef = useRef(AppState.currentState);
   const [pressedKey, setPressedKey] = useState(null);
+  // PŘÍCHOZÍ POZVÁNKA ze skenování QR
+  const [pendingInvite, setPendingInvite] = useState(null); // { fromId, fromPublicKey }
+
+  // ULOŽENÍ FUNGUJÍCÍHO RELAYE DO HISTORIE
+  const markRelayAsWorking = async (relayUrl) => {
+    try {
+      const raw = await SecureStore.getItemAsync('workingRelays');
+      const existing = raw ? JSON.parse(raw) : [];
+      if (!existing.includes(relayUrl)) {
+        existing.unshift(relayUrl); // přidat na začátek = nejvyšší priorita
+        // Držíme max 5 fungujících relayů v historii
+        const trimmed = existing.slice(0, 5);
+        await SecureStore.setItemAsync('workingRelays', JSON.stringify(trimmed));
+      }
+    } catch (e) {
+      console.log("Nepodařilo se uložit fungující relay:", e);
+    }
+  };
+
+  // SESTAVENÍ PRIORITNÍHO SEZNAMU RELAYŮ
+  const buildPrioritizedRelays = async () => {
+    try {
+      const raw = await SecureStore.getItemAsync('workingRelays');
+      const working = raw ? JSON.parse(raw) : [];
+      // Fungující relays na začátek, zbytek jako záloha (bez duplicit)
+      const rest = DHT_ROUTING_RELAYS.filter(r => !working.includes(r));
+      return [...working, ...rest];
+    } catch (e) {
+      return DHT_ROUTING_RELAYS;
+    }
+  };
 
   // ULOŽENÍ PEERA DO HISTORIE (trvalá paměť)
   const savePeerToHistory = async (peerId) => {
@@ -170,19 +201,28 @@ export default function App() {
     let ws;
     let retryTimer;
     let currentRelayIndex = 0;
+    let activeRelays = DHT_ROUTING_RELAYS; // výchozí, přepíše se po načtení
 
-    const establishMeshConnection = () => {
+    const establishMeshConnection = async () => {
       if (!isLoggedIn || !identity.nodeId) return;
 
-      setNetworkStatus(`CONNECTING [Uzel ${currentRelayIndex + 1}]...`);
-      const targetRelay = DHT_ROUTING_RELAYS[currentRelayIndex];
+      // Při prvním pokusu sestavíme prioritizovaný seznam
+      if (currentRelayIndex === 0) {
+        activeRelays = await buildPrioritizedRelays();
+      }
+
+      const targetRelay = activeRelays[currentRelayIndex];
+      setNetworkStatus(`CONNECTING [${currentRelayIndex + 1}/${activeRelays.length}]...`);
 
       try {
         ws = new WebSocket(`${targetRelay}?id=${identity.nodeId}`);
         meshSocket.current = ws;
 
         ws.onopen = async () => {
-          setNetworkStatus("ONLINE (DHT MESH Active)");
+          // Zaznamenat tento relay jako fungující (pro příští start)
+          await markRelayAsWorking(targetRelay);
+          setNetworkStatus(`ONLINE (${targetRelay.replace('wss://', '').split('/')[0]})`);
+
           // Oznámit svou přítomnost v síti
           ws.send(JSON.stringify({ type: "DHT_ANNOUNCE", from: identity.nodeId, publicKey: identity.publicKeyPem }));
 
@@ -193,7 +233,6 @@ export default function App() {
             if (knownPeers.length > 0) {
               setNetworkStatus(`ONLINE – OBNOVUJI ${knownPeers.length} KONTAKTŮ...`);
               knownPeers.forEach((peerId, idx) => {
-                // Rozesíláme handshake s malým rozestupem, aby relay nebyl zahlcen
                 setTimeout(() => {
                   if (ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({
@@ -202,7 +241,6 @@ export default function App() {
                       target: peerId,
                       publicKey: identity.publicKeyPem
                     }));
-                    // Přidáme do seznamu jako "čekající" – alias bude upřesněn po odpovědi
                     setDhtPeers(prev => {
                       if (!prev.some(p => p.id === peerId)) {
                         return [...prev, { id: peerId, alias: `NODE_${peerId.substring(8, 14).toUpperCase()}` }];
@@ -212,9 +250,8 @@ export default function App() {
                   }
                 }, idx * 600);
               });
-              // Po dokončení handshake kola obnovíme status
               setTimeout(() => {
-                setNetworkStatus("ONLINE (DHT MESH Active)");
+                setNetworkStatus(`ONLINE (${targetRelay.replace('wss://', '').split('/')[0]})`);
               }, knownPeers.length * 600 + 500);
             }
           } catch (e) {
@@ -251,6 +288,32 @@ export default function App() {
                 }
               }
 
+              // PŘÍCHOZÍ POZVÁNKA – někdo naskenoval můj QR
+              if (payload.type === "MESH_INVITE_REQUEST") {
+                setPendingInvite({
+                  fromId: payload.from,
+                  fromPublicKey: payload.publicKey
+                });
+              }
+
+              // PŘIJETÍ POZVÁNKY – cílový uzel pozvánku přijal
+              if (payload.type === "MESH_INVITE_ACCEPT") {
+                if (payload.publicKey) {
+                  setPeerKeysDatabase(prev => ({ ...prev, [payload.from]: payload.publicKey }));
+                }
+                setDhtPeers(prev => {
+                  if (!prev.some(p => p.id === payload.from)) {
+                    savePeerToHistory(payload.from);
+                    return [...prev, { id: payload.from, alias: `NODE_${payload.from.substring(8, 14).toUpperCase()}` }];
+                  }
+                  return prev;
+                });
+                // Otevřít chat s přijatým uzlem
+                setActivePeer(payload.from);
+                setMessages([]);
+                setCurrentScreen("chat");
+              }
+
               if (payload.type === "MESH_ENCRYPTED_MSG") {
                 const decryptedText = cryptoEngine.decryptData(payload.cipherText, identity.privateKeyPem);
                 setMessages(prev => [...prev, {
@@ -270,12 +333,12 @@ export default function App() {
 
         ws.onclose = () => {
           setNetworkStatus("DISCONNECTED - RETRYING");
-          currentRelayIndex = (currentRelayIndex + 1) % DHT_ROUTING_RELAYS.length;
+          currentRelayIndex = (currentRelayIndex + 1) % activeRelays.length;
           retryTimer = setTimeout(establishMeshConnection, 2500);
         };
 
       } catch (error) {
-        currentRelayIndex = (currentRelayIndex + 1) % DHT_ROUTING_RELAYS.length;
+        currentRelayIndex = (currentRelayIndex + 1) % activeRelays.length;
         retryTimer = setTimeout(establishMeshConnection, 2500);
       }
     };
@@ -470,13 +533,65 @@ export default function App() {
     if (isCameraScanned) return;
     setIsCameraScanned(true);
     if (data.startsWith("libp2p-")) {
-      initiatePeerHandshake(data);
-      Alert.alert("Uzel zachycen", "Spojení navázáno úspěšně.");
+      if (!meshSocket.current || !networkStatus.includes("ONLINE")) {
+        Alert.alert("Chyba sítě", "Nejsi připojený k síti. Pozvánku nelze odeslat.");
+        setIsCameraScanned(false);
+        return;
+      }
+      // Odeslat pozvánku – NE přímý handshake
+      meshSocket.current.send(JSON.stringify({
+        type: "MESH_INVITE_REQUEST",
+        from: identity.nodeId,
+        target: data,
+        publicKey: identity.publicKeyPem
+      }));
+      setCurrentScreen("menu");
+      Alert.alert(
+        "[ POZVÁNKA ODESLÁNA ]",
+        `Požadavek byl doručen uzlu:\n${data.substring(0, 20)}...\n\nČekám na přijetí.`
+      );
     } else {
       Alert.alert("Neplatný QR kód", "Tento QR neobsahuje platné Node ID.");
       setIsCameraScanned(false);
       setCurrentScreen("menu");
     }
+  };
+
+  const acceptInvite = () => {
+    if (!pendingInvite || !meshSocket.current) return;
+    const { fromId, fromPublicKey } = pendingInvite;
+    // Uložit klíč a peera
+    if (fromPublicKey) {
+      setPeerKeysDatabase(prev => ({ ...prev, [fromId]: fromPublicKey }));
+    }
+    setDhtPeers(prev => {
+      if (!prev.some(p => p.id === fromId)) {
+        savePeerToHistory(fromId);
+        return [...prev, { id: fromId, alias: `NODE_${fromId.substring(8, 14).toUpperCase()}` }];
+      }
+      return prev;
+    });
+    // Odpovědět přijetím + vlastním klíčem
+    meshSocket.current.send(JSON.stringify({
+      type: "MESH_INVITE_ACCEPT",
+      from: identity.nodeId,
+      target: fromId,
+      publicKey: identity.publicKeyPem
+    }));
+    setPendingInvite(null);
+    setActivePeer(fromId);
+    setMessages([]);
+    setCurrentScreen("chat");
+  };
+
+  const rejectInvite = () => {
+    if (!pendingInvite || !meshSocket.current) return;
+    meshSocket.current.send(JSON.stringify({
+      type: "MESH_INVITE_REJECT",
+      from: identity.nodeId,
+      target: pendingInvite.fromId
+    }));
+    setPendingInvite(null);
   };
 
   const layouts = {
@@ -549,6 +664,27 @@ export default function App() {
           <Text style={[styles.statusIndicator, {color: networkStatus.includes("ONLINE") ? "#00E676" : "#FF3B30"}]}>STAV: {networkStatus}</Text>
           <Text style={styles.myIdentityLabel}>NODE ID: {identity.nodeId}</Text>
         </View>
+
+        {/* BANNER PŘÍCHOZÍ POZVÁNKY */}
+        {pendingInvite && (
+          <View style={styles.inviteBanner}>
+            <View style={{flex: 1}}>
+              <Text style={styles.inviteTitle}>⚡ PŘÍCHOZÍ POZVÁNKA</Text>
+              <Text style={styles.inviteNodeId} numberOfLines={1}>
+                {pendingInvite.fromId}
+              </Text>
+              <Text style={styles.inviteSubtext}>Chce navázat šifrovaný chat</Text>
+            </View>
+            <View style={styles.inviteActions}>
+              <TouchableOpacity style={styles.inviteAccept} onPress={acceptInvite}>
+                <Text style={styles.inviteAcceptText}>PŘIJMOUT</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.inviteReject} onPress={rejectInvite}>
+                <Text style={styles.inviteRejectText}>ODMÍTNOUT</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
 
         <ScrollView style={styles.scrollBody}>
           <Text style={styles.blockTitle}>[ OBJEVENÉ UZLY V SÍTI ]</Text>
@@ -846,4 +982,22 @@ const styles = StyleSheet.create({
   blackoutScreen: { flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' },
   blackoutIcon: { fontSize: 40, marginBottom: 16 },
   blackoutText: { color: '#111', fontSize: 11, fontFamily: 'monospace', letterSpacing: 3 },
+  // INVITE BANNER
+  inviteBanner: {
+    backgroundColor: '#02140A',
+    borderBottomWidth: 2,
+    borderBottomColor: '#00E676',
+    padding: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  inviteTitle: { color: '#00E676', fontSize: 11, fontWeight: 'bold', fontFamily: 'monospace', marginBottom: 3 },
+  inviteNodeId: { color: '#FFF', fontSize: 10, fontFamily: 'monospace', marginBottom: 2 },
+  inviteSubtext: { color: '#555', fontSize: 10, fontFamily: 'monospace' },
+  inviteActions: { gap: 8 },
+  inviteAccept: { backgroundColor: '#00C853', paddingVertical: 8, paddingHorizontal: 14, borderRadius: 6 },
+  inviteAcceptText: { color: '#000', fontSize: 11, fontWeight: 'bold', fontFamily: 'monospace' },
+  inviteReject: { backgroundColor: '#1A0808', borderWidth: 1, borderColor: '#2A1010', paddingVertical: 8, paddingHorizontal: 14, borderRadius: 6 },
+  inviteRejectText: { color: '#FF3B30', fontSize: 11, fontWeight: 'bold', fontFamily: 'monospace' },
 });
