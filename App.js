@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, Text, View, TouchableOpacity, ScrollView, Dimensions, Alert, ActivityIndicator } from 'react-native';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { StyleSheet, Text, View, TouchableOpacity, ScrollView, Dimensions, Alert, ActivityIndicator, AppState } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import QRCode from 'react-native-qrcode-svg';
 import CryptoJS from 'crypto-js';
@@ -8,7 +8,10 @@ import * as SecureStore from 'expo-secure-store'; // Přidaná knihovna pro trva
 
 const { width } = Dimensions.get('window');
 
+const PRIMARY_RELAY = "wss://servermajak.onrender.com";
+
 const DHT_ROUTING_RELAYS = [
+  PRIMARY_RELAY,
   "wss://relay.peerjs.com",
   "wss://star.libp2p.io",
   "wss://wrtc-star.discovery.libp2p.io",
@@ -90,6 +93,14 @@ export default function App() {
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [isCameraScanned, setIsCameraScanned] = useState(false);
 
+  // LOCK MODE: 'always' = heslo při každém otevření, 'boot' = jen po restartu telefonu
+  const [lockMode, setLockMode] = useState("always");
+  // BLACKOUT: zakryje obsah když je app v pozadí
+  const [isBlackedOut, setIsBlackedOut] = useState(false);
+  // Sledování stavu AppState pro blackout a zamykání
+  const appStateRef = useRef(AppState.currentState);
+  const [pressedKey, setPressedKey] = useState(null);
+
   // ULOŽENÍ PEERA DO HISTORIE (trvalá paměť)
   const savePeerToHistory = async (peerId) => {
     try {
@@ -110,11 +121,18 @@ export default function App() {
       try {
         const savedHash = await SecureStore.getItemAsync('masterHash');
         const savedIdentity = await SecureStore.getItemAsync('userIdentity');
-        
+        const savedLockMode = await SecureStore.getItemAsync('lockMode');
+
+        if (savedLockMode) setLockMode(savedLockMode);
+
         if (savedHash && savedIdentity) {
           setMasterHash(savedHash);
           setIdentity(JSON.parse(savedIdentity));
           setIsFirstLaunch(false);
+          // Pokud je lockMode 'boot', rovnou přihlásit bez hesla
+          if (savedLockMode === 'boot') {
+            setIsLoggedIn(true);
+          }
         }
       } catch (e) {
         console.log("Nepodařilo se načíst identitu z paměti.");
@@ -122,6 +140,32 @@ export default function App() {
     }
     checkExistingIdentity();
   }, []);
+
+  // APPSTATE – blackout + zamykání při přechodu do pozadí
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      const prev = appStateRef.current;
+      appStateRef.current = nextState;
+
+      if (nextState === 'background' || nextState === 'inactive') {
+        // App šla do pozadí – zakrýt obsah
+        setIsBlackedOut(true);
+        // Pokud je lockMode 'always' a uživatel je přihlášen, odhlásit
+        if (lockMode === 'always' && isLoggedIn) {
+          setIsLoggedIn(false);
+          setPasswordInput("");
+        }
+      }
+
+      if (nextState === 'active' && (prev === 'background' || prev === 'inactive')) {
+        // App se vrátila do popředí
+        setIsBlackedOut(false);
+        // lockMode 'boot' – neptat se na heslo, jen odhalit
+      }
+    });
+
+    return () => subscription.remove();
+  }, [lockMode, isLoggedIn]);
 
   // Síťový useEffect pro správu P2P komunikace
   useEffect(() => {
@@ -273,6 +317,9 @@ export default function App() {
 
   const handleVirtualKeyboard = async (char) => {
     if (isMiningPoW || isProcessingKeys) return;
+    // Vizuální feedback – zvýraznit stisknutou klávesu
+    setPressedKey(char);
+    setTimeout(() => setPressedKey(null), 120);
 
     if (char === "⌫") {
       if (!isLoggedIn) setPasswordInput(prev => prev.slice(0, -1));
@@ -382,6 +429,28 @@ export default function App() {
           setMasterHash(generatedHash);
           setIsFirstLaunch(false);
           setIsLoggedIn(true);
+
+          // Informovat uživatele o primárním relay serveru + zeptat se na lock mode
+          Alert.alert(
+            "[ SÍŤOVÁ KONFIGURACE ]",
+            `Váš uzel byl úspěšně vygenerován.\n\nPrimární relay server:\n${PRIMARY_RELAY}\n\nZvolte režim zamykání aplikace:`,
+            [
+              {
+                text: "🔒 Heslo při každém otevření",
+                onPress: async () => {
+                  await SecureStore.setItemAsync('lockMode', 'always');
+                  setLockMode('always');
+                }
+              },
+              {
+                text: "⚡ Heslo jen po restartu",
+                onPress: async () => {
+                  await SecureStore.setItemAsync('lockMode', 'boot');
+                  setLockMode('boot');
+                }
+              }
+            ]
+          );
         } else {
           // DALŠÍ SPUŠTĚNÍ - Kontrola hesla vůči uloženému hashi
           if (generatedHash === masterHash || passwordInput === "1234") {
@@ -453,13 +522,23 @@ export default function App() {
           {layouts[kbdMode].map((row, i) => (
             <View key={i} style={styles.boardRow}>
               {row.map(btn => (
-                <TouchableOpacity key={btn} disabled={isProcessingKeys} onPress={() => handleVirtualKeyboard(btn)} style={[styles.tile, isProcessingKeys && styles.tileLock, btn === "POTVRDIT" && styles.tileAction, btn === "⌫" && styles.tileDelete, (btn === "SPACE" || btn === "POTVRDIT") && styles.tileExtended]}>
+                <TouchableOpacity key={btn} disabled={isProcessingKeys} onPress={() => handleVirtualKeyboard(btn)} style={[styles.tile, isProcessingKeys && styles.tileLock, pressedKey === btn && styles.tilePressed, btn === "POTVRDIT" && styles.tileAction, btn === "⌫" && styles.tileDelete, (btn === "SPACE" || btn === "POTVRDIT") && styles.tileExtended]}>
                   <Text style={[styles.tileText, btn === "POTVRDIT" && styles.tileActionText]}>{btn}</Text>
                 </TouchableOpacity>
               ))}
             </View>
           ))}
         </View>
+      </View>
+    );
+  }
+
+  // BLACKOUT OVERLAY – zakryje obsah při přechodu do pozadí
+  if (isBlackedOut) {
+    return (
+      <View style={styles.blackoutScreen}>
+        <Text style={styles.blackoutIcon}>⬛</Text>
+        <Text style={styles.blackoutText}>ZABEZPEČENO</Text>
       </View>
     );
   }
@@ -508,13 +587,77 @@ export default function App() {
           }}>
             <Text style={[styles.actionBtnText, {color: '#00E676'}]}>NASKENOVAT P2P QR KÓD</Text>
           </TouchableOpacity>
+
+          <TouchableOpacity style={[styles.actionBtn, {borderColor: '#333'}]} onPress={() => setCurrentScreen("settings")}>
+            <Text style={[styles.actionBtnText, {color: '#555'}]}>⚙ NASTAVENÍ ZABEZPEČENÍ</Text>
+          </TouchableOpacity>
+
         </ScrollView>
       </View>
     );
   }
 
-  if (currentScreen === "qr_view") {
+  if (currentScreen === "settings") {
     return (
+      <View style={styles.windowFrame}>
+        <View style={styles.statusBar}>
+          <Text style={styles.statusTitle}>[ NASTAVENÍ ZABEZPEČENÍ ]</Text>
+        </View>
+        <View style={{flex: 1, padding: 25}}>
+          <Text style={styles.blockTitle}>[ REŽIM ZAMYKÁNÍ ]</Text>
+          <Text style={{color: '#555', fontSize: 11, fontFamily: 'monospace', marginBottom: 20, lineHeight: 18}}>
+            Zvolte, kdy má aplikace vyžadovat zadání hesla.
+          </Text>
+
+          <TouchableOpacity
+            style={[styles.settingOption, lockMode === 'always' && styles.settingOptionActive]}
+            onPress={async () => {
+              setLockMode('always');
+              await SecureStore.setItemAsync('lockMode', 'always');
+            }}
+          >
+            <View style={styles.settingRadio}>
+              {lockMode === 'always' && <View style={styles.settingRadioDot} />}
+            </View>
+            <View style={{flex: 1}}>
+              <Text style={[styles.settingLabel, lockMode === 'always' && {color: '#FFF'}]}>
+                🔒  PŘI KAŽDÉM OTEVŘENÍ
+              </Text>
+              <Text style={styles.settingDesc}>
+                Heslo se vyžaduje pokaždé, když přepnete zpět do aplikace.
+              </Text>
+            </View>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.settingOption, lockMode === 'boot' && styles.settingOptionActive]}
+            onPress={async () => {
+              setLockMode('boot');
+              await SecureStore.setItemAsync('lockMode', 'boot');
+            }}
+          >
+            <View style={styles.settingRadio}>
+              {lockMode === 'boot' && <View style={styles.settingRadioDot} />}
+            </View>
+            <View style={{flex: 1}}>
+              <Text style={[styles.settingLabel, lockMode === 'boot' && {color: '#FFF'}]}>
+                ⚡  JEN PO RESTARTU TELEFONU
+              </Text>
+              <Text style={styles.settingDesc}>
+                Heslo se vyžaduje pouze po zapnutí zařízení. Přepínání aplikací heslo nespustí.
+              </Text>
+            </View>
+          </TouchableOpacity>
+
+          <TouchableOpacity style={[styles.escapeBtn, {marginTop: 30, alignSelf: 'center'}]} onPress={() => setCurrentScreen("menu")}>
+            <Text style={styles.escapeBtnText}>ULOŽIT A ZPĚT</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    );
+  }
+
+  if (currentScreen === "qr_view") {    return (
       <View style={styles.windowFrame}>
         <View style={styles.statusBar}>
           <Text style={styles.statusTitle}>[ ANONYMNÍ ADRESA ]</Text>
@@ -572,7 +715,7 @@ export default function App() {
           {layouts[kbdMode].map((row, i) => (
             <View key={i} style={styles.boardRow}>
               {row.map(btn => (
-                <TouchableOpacity key={btn} onPress={() => handleVirtualKeyboard(btn)} style={[styles.tile, btn === "POTVRDIT" && styles.tileAction, btn === "⌫" && styles.tileDelete, (btn === "SPACE" || btn === "POTVRDIT") && styles.tileExtended]}>
+                <TouchableOpacity key={btn} onPress={() => handleVirtualKeyboard(btn)} style={[styles.tile, pressedKey === btn && styles.tilePressed, btn === "POTVRDIT" && styles.tileAction, btn === "⌫" && styles.tileDelete, (btn === "SPACE" || btn === "POTVRDIT") && styles.tileExtended]}>
                   <Text style={[styles.tileText, btn === "POTVRDIT" && styles.tileActionText]}>{btn}</Text>
                 </TouchableOpacity>
               ))}
@@ -618,7 +761,7 @@ export default function App() {
         {layouts[kbdMode].map((row, rowIndex) => (
           <View key={rowIndex} style={styles.boardRow}>
             {row.map((btn) => (
-              <TouchableOpacity key={btn} disabled={isMiningPoW} onPress={() => handleVirtualKeyboard(btn)} style={[styles.tile, isMiningPoW && styles.tileLock, (btn === "SPACE" || btn === "POTVRDIT") && styles.tileExtended, btn === "POTVRDIT" && styles.tileAction, btn === "⌫" && styles.tileDelete]}>
+              <TouchableOpacity key={btn} disabled={isMiningPoW} onPress={() => handleVirtualKeyboard(btn)} style={[styles.tile, isMiningPoW && styles.tileLock, pressedKey === btn && !isMiningPoW && styles.tilePressed, (btn === "SPACE" || btn === "POTVRDIT") && styles.tileExtended, btn === "POTVRDIT" && styles.tileAction, btn === "⌫" && styles.tileDelete]}>
                 <Text style={[styles.tileText, btn === "POTVRDIT" && styles.tileActionText]}>{btn}</Text>
               </TouchableOpacity>
             ))}
@@ -668,14 +811,41 @@ const styles = StyleSheet.create({
   powLoaderText: { color: '#00E676', fontSize: 10, fontFamily: 'monospace', flex: 1 },
   inputBarBox: { backgroundColor: '#080808', padding: 14, minHeight: 50, borderTopWidth: 1, borderTopColor: '#151515' },
   inputBarText: { color: '#FFF', fontSize: 14 },
-  boardContainer: { backgroundColor: '#050505', padding: 2, paddingBottom: 15, borderTopWidth: 1, borderTopColor: '#151515' },
-  boardRow: { flexDirection: 'row', justifyContent: 'center', marginBottom: 2 },
-  tile: { flex: 1, height: 42, backgroundColor: '#101010', justifyContent: 'center', alignItems: 'center', margin: 1, borderRadius: 4, borderWidth: 1, borderColor: '#181818' },
+  boardContainer: { backgroundColor: '#050505', padding: 6, paddingBottom: 18, borderTopWidth: 1, borderTopColor: '#151515' },
+  boardRow: { flexDirection: 'row', justifyContent: 'center', marginBottom: 4 },
+  tile: {
+    flex: 1,
+    height: 48,
+    backgroundColor: '#141414',
+    justifyContent: 'center',
+    alignItems: 'center',
+    margin: 2,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#222',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.4,
+    shadowRadius: 3,
+    elevation: 3,
+  },
   tileLock: { opacity: 0.15 },
-  tileExtended: { flex: 2.6, backgroundColor: '#181818' },
-  tileAction: { backgroundColor: '#00E676', borderColor: '#00E676' },
-  tileDelete: { backgroundColor: '#210A0A', borderColor: '#331010' },
-  tileText: { color: '#FFF', fontSize: 12, fontWeight: 'bold' },
-  tileActionText: { color: '#000' },
-  abortChatBtn: { backgroundColor: '#0A0A0A', paddingVertical: 5, paddingHorizontal: 10, borderRadius: 4, borderWidth: 1, borderColor: '#222' }
+  tilePressed: { backgroundColor: '#1E1E1E', borderColor: '#00E676', transform: [{ scale: 0.94 }] },
+  tileExtended: { flex: 2.8, backgroundColor: '#1A1A1A', borderColor: '#252525' },
+  tileAction: { backgroundColor: '#00C853', borderColor: '#00E676', flex: 2.8 },
+  tileDelete: { backgroundColor: '#1A0808', borderColor: '#2A1010' },
+  tileText: { color: '#DDD', fontSize: 13, fontWeight: '600', letterSpacing: 0.3 },
+  tileActionText: { color: '#000', fontWeight: 'bold', fontSize: 13, letterSpacing: 0.5 },
+  abortChatBtn: { backgroundColor: '#0A0A0A', paddingVertical: 5, paddingHorizontal: 10, borderRadius: 4, borderWidth: 1, borderColor: '#222' },
+  // SETTINGS
+  settingOption: { flexDirection: 'row', alignItems: 'flex-start', backgroundColor: '#0A0A0A', borderWidth: 1, borderColor: '#1C1C1C', borderRadius: 8, padding: 16, marginBottom: 12 },
+  settingOptionActive: { borderColor: '#00E676', backgroundColor: '#021408' },
+  settingRadio: { width: 18, height: 18, borderRadius: 9, borderWidth: 2, borderColor: '#444', justifyContent: 'center', alignItems: 'center', marginRight: 14, marginTop: 2 },
+  settingRadioDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#00E676' },
+  settingLabel: { color: '#888', fontSize: 12, fontWeight: 'bold', fontFamily: 'monospace', marginBottom: 4 },
+  settingDesc: { color: '#444', fontSize: 11, fontFamily: 'monospace', lineHeight: 16 },
+  // BLACKOUT
+  blackoutScreen: { flex: 1, backgroundColor: '#000', justifyContent: 'center', alignItems: 'center' },
+  blackoutIcon: { fontSize: 40, marginBottom: 16 },
+  blackoutText: { color: '#111', fontSize: 11, fontFamily: 'monospace', letterSpacing: 3 },
 });
