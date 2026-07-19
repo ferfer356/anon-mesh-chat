@@ -8,10 +8,7 @@ import * as SecureStore from 'expo-secure-store'; // Přidaná knihovna pro trva
 
 const { width } = Dimensions.get('window');
 
-const PRIMARY_RELAY = "wss://servermajak.onrender.com";
-
 const DHT_ROUTING_RELAYS = [
-  PRIMARY_RELAY,
   "wss://relay.peerjs.com",
   "wss://star.libp2p.io",
   "wss://wrtc-star.discovery.libp2p.io",
@@ -19,7 +16,8 @@ const DHT_ROUTING_RELAYS = [
   "wss://0.peerjs.com:443",
   "wss://broker.hivemq.com:8884",
   "wss://wrtc-star1.paral.io",
-  "wss://wrtc-star2.paral.io"
+  "wss://wrtc-star2.paral.io",
+  "wss://servermajak.onrender.com"
 ];
 
 const cryptoEngine = {
@@ -433,7 +431,7 @@ export default function App() {
           // Informovat uživatele o primárním relay serveru + zeptat se na lock mode
           Alert.alert(
             "[ SÍŤOVÁ KONFIGURACE ]",
-            `Váš uzel byl úspěšně vygenerován.\n\nPrimární relay server:\n${PRIMARY_RELAY}\n\nZvolte režim zamykání aplikace:`,
+            `Váš uzel byl úspěšně vygenerován.\n\nAplikace se připojí k dostupnému relay serveru z DHT sítě a automaticky zvolí nejrychlejší uzel.\n\nZvolte režim zamykání aplikace:`,
             [
               {
                 text: "🔒 Heslo při každém otevření",
